@@ -594,7 +594,7 @@ INDEX_HTML = PAGE_HEAD + """
         </div>
         <div class="toggle-row" style="margin:1rem 0 0;">
           <span>📱 iPhone-friendly (H.264) <small style="opacity:.7">· max 1080p</small></span>
-          <label class="switch"><input type="checkbox" id="iosToggle"><span class="track"></span></label>
+          <label class="switch"><input type="checkbox" id="iosToggle" checked><span class="track"></span></label>
         </div>
       </div>
       <div class="quality-block" id="audioQualityBlock" style="display:none;">
@@ -823,11 +823,6 @@ async function submitUrl(url, options){
   await fetch('/download', {method:'POST', body: new URLSearchParams({url, ...options})});
   poll();
 }
-
-// iPhones/iPads can't play AV1 natively (and Photos rejects it), so default the H.264 toggle on there.
-const isIOS = /iPhone|iPad|iPod/.test(navigator.userAgent) ||
-              (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
-if (isIOS) document.getElementById('iosToggle').checked = true;
 
 const pasteHint = document.getElementById('pasteHint');
 document.getElementById('pasteBtn').addEventListener('click', async () => {
