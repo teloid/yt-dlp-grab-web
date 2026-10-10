@@ -49,6 +49,19 @@ VIDEO_QUALITY_LABELS = {
     "best": "Best", "2160": "4K", "1440": "1440p", "1080": "1080p",
     "720": "720p", "480": "480p", "360": "360p",
 }
+VIDEO_QUALITY_HEIGHTS = {"2160": 2160, "1440": 1440, "1080": 1080, "720": 720, "480": 480, "360": 360}
+
+
+def video_format(quality: str, ios_compat: bool) -> str:
+    """yt-dlp format string. With ios_compat, try H.264 (avc1) first — the
+    codec every iPhone can play natively and import to Photos — and only fall
+    back to the regular selection if the video has no H.264 stream at all."""
+    base = VIDEO_QUALITY_FORMATS.get(quality, VIDEO_QUALITY_FORMATS["best"])
+    if not ios_compat:
+        return base
+    h = VIDEO_QUALITY_HEIGHTS.get(quality)
+    height = f"[height<={h}]" if h else ""
+    return f"bv*[vcodec^=avc1][ext=mp4]{height}+ba[ext=m4a]/{base}"
 AUDIO_QUALITY_ARGS = {
     "default": None, "320": "320K", "256": "256K", "192": "192K", "128": "128K",
 }
@@ -58,7 +71,7 @@ AUDIO_QUALITY_LABELS = {
 
 
 def build_args(url: str, job_dir: Path, embed_thumbnail: bool, save_thumbnail: bool,
-                audio_only: bool, video_quality: str, audio_quality: str) -> list[str]:
+                audio_only: bool, video_quality: str, audio_quality: str, ios_compat: bool = False) -> list[str]:
     args = ["yt-dlp", "--newline", "--no-playlist"]
     if COOKIES_PATH.exists():
         args += ["--cookies", str(COOKIES_PATH)]
@@ -69,8 +82,7 @@ def build_args(url: str, job_dir: Path, embed_thumbnail: bool, save_thumbnail: b
         if aq:
             args += ["--audio-quality", aq]
     else:
-        fmt = VIDEO_QUALITY_FORMATS.get(video_quality, VIDEO_QUALITY_FORMATS["best"])
-        args += ["-f", fmt, "--merge-output-format", "mp4"]
+        args += ["-f", video_format(video_quality, ios_compat), "--merge-output-format", "mp4"]
     if save_thumbnail:
         args += ["--write-thumbnail"]
     if embed_thumbnail:
@@ -82,13 +94,15 @@ def build_args(url: str, job_dir: Path, embed_thumbnail: bool, save_thumbnail: b
 
 
 def run_job(job_id: str, url: str, embed_thumbnail: bool, save_thumbnail: bool,
-            audio_only: bool, video_quality: str, audio_quality: str):
+            audio_only: bool, video_quality: str, audio_quality: str, ios_compat: bool = False):
     job_dir = SCRATCH_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
     if audio_only:
         quality_label = f"MP3 · {AUDIO_QUALITY_LABELS.get(audio_quality, 'Best')}"
     else:
         quality_label = VIDEO_QUALITY_LABELS.get(video_quality, "Best")
+        if ios_compat:
+            quality_label += " · H.264"
     with JOBS_LOCK:
         JOBS[job_id] = {
             "url": url,
@@ -114,7 +128,7 @@ def run_job(job_id: str, url: str, embed_thumbnail: bool, save_thumbnail: bool,
 
     try:
         proc = subprocess.Popen(
-            build_args(url, job_dir, embed_thumbnail, save_thumbnail, audio_only, video_quality, audio_quality),
+            build_args(url, job_dir, embed_thumbnail, save_thumbnail, audio_only, video_quality, audio_quality, ios_compat),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             preexec_fn=os.setsid,  # own process group, so cancel can kill yt-dlp + any ffmpeg child together
@@ -229,12 +243,13 @@ def download():
     audio_only = request.form.get("audio_only") == "1"
     video_quality = request.form.get("video_quality", "best")
     audio_quality = request.form.get("audio_quality", "default")
+    ios_compat = request.form.get("ios_compat") == "1"
     if not url:
         return jsonify({"error": "missing url"}), 400
     job_id = uuid.uuid4().hex[:10]
     threading.Thread(
         target=run_job,
-        args=(job_id, url, embed_thumbnail, save_thumbnail, audio_only, video_quality, audio_quality),
+        args=(job_id, url, embed_thumbnail, save_thumbnail, audio_only, video_quality, audio_quality, ios_compat),
         daemon=True,
     ).start()
     return jsonify({"id": job_id})
@@ -415,11 +430,22 @@ BASE_STYLE = """
   .dot{width:.5rem; height:.5rem; border-radius:50%; background:currentColor;}
   .field{position:relative; margin-bottom:1rem;}
   input[type=text]{
-    width:100%; padding:.95rem 1.1rem; font-size:1rem; font-family:inherit;
+    width:100%; padding:.95rem 3.4rem .95rem 1.1rem; font-size:1rem; font-family:inherit;
     border-radius:16px; border:1px solid var(--card-border); background:rgba(0,0,0,.25); color:var(--text);
     outline:none; transition:border-color .2s, box-shadow .2s;
   }
   input[type=text]:focus{border-color:var(--accent); box-shadow:0 0 0 3px rgba(224,164,88,.25);}
+  input[type=text].flash{animation:flash .6s ease;}
+  @keyframes flash{0%{box-shadow:0 0 0 0 rgba(224,164,88,.55);} 100%{box-shadow:0 0 0 10px rgba(224,164,88,0);}}
+  .paste-btn{
+    position:absolute; right:.45rem; top:50%; transform:translateY(-50%);
+    width:2.3rem; height:2.3rem; border:none; border-radius:10px; cursor:pointer;
+    background:rgba(255,255,255,.08); color:var(--text-dim); font-size:1.05rem;
+    transition:background .15s, color .15s;
+  }
+  .paste-btn:hover{background:rgba(255,255,255,.16); color:var(--text);}
+  .hint{font-size:.76rem; color:var(--warn); margin:-.5rem .2rem 1rem; opacity:0; max-height:0; overflow:hidden; transition:opacity .25s, max-height .25s;}
+  .hint.show{opacity:1; max-height:3rem;}
   .toggle-row{display:flex; align-items:center; justify-content:space-between; margin:0 .1rem 1.2rem;}
   .toggle-row span{font-size:.9rem; color:var(--text-dim); font-weight:500;}
   .quality-block{margin:0 .1rem 1.2rem;}
@@ -546,8 +572,11 @@ INDEX_HTML = PAGE_HEAD + """
   <div class="card">
     <form id="dlform">
       <div class="field">
-        <input type="text" id="url" placeholder="Paste a video link…" autocomplete="off" autofocus required>
+        <input type="text" id="url" placeholder="Paste a video link…" inputmode="url" autocomplete="off"
+               autocapitalize="off" autocorrect="off" spellcheck="false" autofocus required>
+        <button type="button" class="paste-btn" id="pasteBtn" title="Paste from clipboard" aria-label="Paste from clipboard">📋</button>
       </div>
+      <div class="hint" id="pasteHint">One-tap paste is blocked on plain http — long-press the field and tap Paste.</div>
       <div class="toggle-row">
         <span>🎵 Audio only (MP3)</span>
         <label class="switch"><input type="checkbox" id="audioToggle"><span class="track"></span></label>
@@ -562,6 +591,10 @@ INDEX_HTML = PAGE_HEAD + """
           <label class="chip"><input type="radio" name="vq" value="720"><span>720p</span></label>
           <label class="chip"><input type="radio" name="vq" value="480"><span>480p</span></label>
           <label class="chip"><input type="radio" name="vq" value="360"><span>360p</span></label>
+        </div>
+        <div class="toggle-row" style="margin:1rem 0 0;">
+          <span>📱 iPhone-friendly (H.264) <small style="opacity:.7">· max 1080p</small></span>
+          <label class="switch"><input type="checkbox" id="iosToggle"><span class="track"></span></label>
         </div>
       </div>
       <div class="quality-block" id="audioQualityBlock" style="display:none;">
@@ -657,14 +690,7 @@ function updateCard(c, job){
         <details><summary>Show details</summary><pre></pre></details>`;
       c.actions.querySelector('pre').textContent = job.tail || '(no output)';
       c.actions.querySelectorAll('.btn-small')[0].onclick = () => {
-        submitUrl(
-          job.url,
-          document.getElementById('audioToggle').checked,
-          document.getElementById('embedToggle').checked,
-          document.getElementById('saveThumbToggle').checked,
-          getVideoQuality(),
-          getAudioQuality()
-        );
+        submitUrl(job.url, currentOptions());
         removeCard(job.id);
       };
       c.actions.querySelectorAll('.btn-small')[1].onclick = () => { fetch('/jobs/'+job.id, {method:'DELETE'}); removeCard(job.id); };
@@ -780,21 +806,47 @@ renderEmpty();
 setInterval(poll, 1300);
 poll();
 
-async function submitUrl(url, audioOnly, embedThumbnail, saveThumbnail, videoQuality, audioQuality){
-  const body = new URLSearchParams({
-    url,
-    audio_only: audioOnly ? '1' : '0',
-    embed_thumbnail: embedThumbnail ? '1' : '0',
-    save_thumbnail: saveThumbnail ? '1' : '0',
-    video_quality: videoQuality,
-    audio_quality: audioQuality,
-  });
-  await fetch('/download', {method:'POST', body});
+const flag = (id) => document.getElementById(id).checked ? '1' : '0';
+
+function currentOptions(){
+  return {
+    audio_only: flag('audioToggle'),
+    embed_thumbnail: flag('embedToggle'),
+    save_thumbnail: flag('saveThumbToggle'),
+    ios_compat: flag('iosToggle'),
+    video_quality: document.querySelector('input[name="vq"]:checked').value,
+    audio_quality: document.querySelector('input[name="aq"]:checked').value,
+  };
+}
+
+async function submitUrl(url, options){
+  await fetch('/download', {method:'POST', body: new URLSearchParams({url, ...options})});
   poll();
 }
 
-function getVideoQuality(){ return document.querySelector('input[name="vq"]:checked').value; }
-function getAudioQuality(){ return document.querySelector('input[name="aq"]:checked').value; }
+// iPhones/iPads can't play AV1 natively (and Photos rejects it), so default the H.264 toggle on there.
+const isIOS = /iPhone|iPad|iPod/.test(navigator.userAgent) ||
+              (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+if (isIOS) document.getElementById('iosToggle').checked = true;
+
+const pasteHint = document.getElementById('pasteHint');
+document.getElementById('pasteBtn').addEventListener('click', async () => {
+  const field = document.getElementById('url');
+  field.focus();
+  if (window.isSecureContext && navigator.clipboard && navigator.clipboard.readText) {
+    try {
+      const text = (await navigator.clipboard.readText()).trim();
+      if (text) {
+        field.value = text;
+        field.classList.remove('flash'); void field.offsetWidth; field.classList.add('flash');
+        pasteHint.classList.remove('show');
+        return;
+      }
+    } catch (e) { /* permission denied — fall through to the hint */ }
+  }
+  pasteHint.classList.add('show');
+  setTimeout(() => pasteHint.classList.remove('show'), 6000);
+});
 
 const form = document.getElementById('dlform');
 const input = document.getElementById('url');
@@ -817,14 +869,7 @@ form.addEventListener('submit', async (e) => {
   submitBtn.disabled = true;
   submitLabel.innerHTML = '<span class="spinner"></span>';
   try {
-    await submitUrl(
-      url,
-      audioToggle.checked,
-      document.getElementById('embedToggle').checked,
-      document.getElementById('saveThumbToggle').checked,
-      getVideoQuality(),
-      getAudioQuality()
-    );
+    await submitUrl(url, currentOptions());
     input.value = '';
   } finally {
     submitBtn.disabled = false;

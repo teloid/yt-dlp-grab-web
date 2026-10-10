@@ -4,6 +4,7 @@ A tiny, self-hosted YouTube (and anything else [yt-dlp](https://github.com/yt-dl
 
 - **No files are kept on the server.** Each download lives in a temporary per-job folder just long enough to process, then streams straight to your browser and is deleted the moment the transfer finishes (or the instant you cancel it).
 - **Quality presets** for video (Best/4K/1440p/1080p/720p/480p/360p) and MP3 (Best/320k/256k/192k/128k).
+- **iPhone-friendly mode** (H.264). YouTube's "best" MP4 is often AV1, which most iPhones can't play in the built-in player or import into Photos. The toggle prefers H.264 instead (capped at 1080p, which is the most H.264 YouTube offers) and switches itself on automatically when you open the page on an iPhone/iPad.
 - **Optional thumbnail embedding** and/or **saving the thumbnail as its own file** — independent toggles, either, both, or neither.
 - **Cancel button** that actually kills the underlying `yt-dlp`/`ffmpeg` process and wipes the partial file — not just a UI dismiss.
 - **Cookies** upload straight from the browser (Settings tab) for age-restricted / members-only content.
@@ -80,6 +81,14 @@ yt-dlp-grab-web/
 1. You submit a URL + options. A background thread runs `yt-dlp` as a real subprocess (not the Python library), with your chosen format/quality flags, into a fresh temp folder in its own process group.
 2. The UI polls for progress, parsed straight out of yt-dlp's own `[download] NN%` / `[Merger]` / `[EmbedThumbnail]` log lines.
 3. When it's done, the "Save to your device" button streams the file to your browser via a generator response — the moment that stream finishes, a `finally` block deletes the file (and cleans up the job) server-side. Cancelling does the same thing, except it also sends `SIGTERM` to the whole process group first so a mid-merge `ffmpeg` child doesn't linger.
+
+## Troubleshooting
+
+**"Sign in to confirm you're not a bot"** — YouTube is rejecting the request. Upload fresh cookies in Settings (export them from a private/incognito window, then close it, so the browser doesn't rotate the session out from under the file). A stale or rotated `cookies.txt` is the usual cause.
+
+**Downloaded video won't play on iPhone / "Save to Photos" does nothing** — turn on *iPhone-friendly (H.264)* (it's on by default when opened from an iPhone). If it still misbehaves, try again with *Embed thumbnail* off.
+
+**The 📋 paste button shows a hint instead of pasting** — browsers only allow one-tap clipboard reads on HTTPS (or localhost). Over plain `http://` on your LAN, long-press the field and tap *Paste* instead. Serving the app over HTTPS (e.g. via a reverse proxy or Tailscale) makes the button work.
 
 ## Security notes
 
