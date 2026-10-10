@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import shutil
@@ -5,8 +6,10 @@ import signal
 import subprocess
 import threading
 import time
+import unicodedata
 import uuid
 from pathlib import Path
+from urllib.parse import quote
 
 from flask import Flask, request, redirect, url_for, Response, jsonify, render_template_string
 
@@ -93,6 +96,137 @@ def build_args(url: str, job_dir: Path, embed_thumbnail: bool, save_thumbnail: b
     return args
 
 
+CODEC_NAMES = {
+    "h264": "H.264", "hevc": "HEVC", "av1": "AV1", "vp9": "VP9", "vp8": "VP8",
+    "aac": "AAC", "mp3": "MP3", "opus": "Opus", "vorbis": "Vorbis", "ac3": "AC-3", "flac": "FLAC",
+}
+
+
+def note(job_id: str, line: str):
+    with JOBS_LOCK:
+        if job_id in JOBS:
+            JOBS[job_id]["tail"] = (JOBS[job_id]["tail"] + "\n" + line).strip("\n")
+
+
+def probe_media(path: Path) -> dict:
+    r = subprocess.run(["ffprobe", "-v", "error", "-show_streams", "-show_format", "-of", "json", str(path)],
+                       capture_output=True, text=True, timeout=60)
+    return json.loads(r.stdout or "{}")
+
+
+def pick_streams(info: dict):
+    video = audio = cover = None
+    for s in info.get("streams", []):
+        kind = s.get("codec_type")
+        if kind == "video":
+            if s.get("disposition", {}).get("attached_pic"):
+                cover = cover or s
+            elif video is None:
+                video = s
+        elif kind == "audio" and audio is None:
+            audio = s
+    return video, audio, cover
+
+
+def describe_media(video, audio) -> str:
+    name = lambda s: CODEC_NAMES.get(s.get("codec_name"), str(s.get("codec_name")).upper())
+    codecs = f"{name(video) if video else 'no video'} + {name(audio) if audio else 'no audio'}"
+    if video and video.get("width") and video.get("height"):
+        return f"{codecs} · {video['width']}×{video['height']}"
+    return codecs
+
+
+def ios_plan(video, audio):
+    """What iOS needs changed to play the file and import it into Photos.
+    Returns None if it's already fine, else (video_action, audio_action)."""
+    if not video:
+        return None
+    vcodec, pix = video.get("codec_name"), video.get("pix_fmt", "")
+    if vcodec == "h264" and pix in ("yuv420p", "yuvj420p"):
+        v = "copy"
+    elif vcodec == "hevc" and pix in ("yuv420p", "yuv420p10le"):
+        v = "copy" if video.get("codec_tag_string") == "hvc1" else "retag"  # hev1 tag won't play on Apple
+    else:
+        v = "transcode"
+    a = "transcode" if audio and audio.get("codec_name") not in ("aac", "mp3", "alac") else "copy"
+    return None if (v, a) == ("copy", "copy") else (v, a)
+
+
+def convert_for_ios(job_id: str, src: Path, video, audio, cover, plan, duration) -> bool:
+    v_act, a_act = plan
+    out = src.with_name(src.stem + ".ios.mp4")
+    cmd = ["ffmpeg", "-y", "-nostdin", "-v", "error", "-progress", "pipe:1", "-nostats",
+           "-i", str(src), "-map", f"0:{video['index']}"]
+    if audio:
+        cmd += ["-map", f"0:{audio['index']}"]
+    if cover:  # keep an embedded thumbnail as a second "video" stream flagged as cover art
+        cmd += ["-map", f"0:{cover['index']}"]
+    if v_act == "transcode":
+        cmd += ["-c:v:0", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p"]
+    elif v_act == "retag":
+        cmd += ["-c:v:0", "copy", "-tag:v:0", "hvc1"]
+    else:
+        cmd += ["-c:v:0", "copy"]
+    if cover:
+        cmd += ["-c:v:1", "copy", "-disposition:v:1", "attached_pic"]
+    if audio:
+        cmd += ["-c:a:0", "aac", "-b:a", "192k"] if a_act == "transcode" else ["-c:a:0", "copy"]
+    cmd += ["-movflags", "+faststart", str(out)]
+
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, preexec_fn=os.setsid)
+    with JOBS_LOCK:
+        if job_id not in JOBS:  # cancelled while we were setting up
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            return False
+        JOBS[job_id]["proc"] = proc  # so cancel kills this ffmpeg too
+        JOBS[job_id]["converting"] = True
+        JOBS[job_id]["convert_pct"] = None
+    errors = []
+    for line in proc.stdout:
+        line = line.strip()
+        if line.startswith("out_time_us=") and duration:
+            try:
+                pct = min(99.0, int(line.split("=", 1)[1]) / 1e6 / duration * 100)
+            except ValueError:
+                continue
+            with JOBS_LOCK:
+                if job_id in JOBS:
+                    JOBS[job_id]["convert_pct"] = pct
+        elif line and not re.match(r"^[a-z_0-9]+=", line):
+            errors = (errors + [line])[-5:]
+    proc.wait()
+    with JOBS_LOCK:
+        if job_id in JOBS:
+            JOBS[job_id]["converting"] = False
+    if proc.returncode == 0 and out.exists():
+        os.replace(out, src)
+        return True
+    out.unlink(missing_ok=True)
+    note(job_id, "[iPhone] conversion failed, keeping the original file: " + " | ".join(errors))
+    return False
+
+
+def finalize_media(job_id: str, path: Path, ios_compat: bool):
+    """Inspect the finished file and, in iPhone mode, convert it if iOS wouldn't play it.
+    Never fails the job — worst case the original file is delivered."""
+    try:
+        info = probe_media(path)
+        video, audio, cover = pick_streams(info)
+        plan = ios_plan(video, audio) if ios_compat else None
+        if plan:
+            note(job_id, f"[iPhone] {describe_media(video, audio)} won't play on iPhone — converting")
+            duration = float(info.get("format", {}).get("duration") or 0) or None
+            if convert_for_ios(job_id, path, video, audio, cover, plan, duration):
+                video, audio, _ = pick_streams(probe_media(path))
+        text = describe_media(video, audio)
+    except Exception as exc:
+        note(job_id, f"[iPhone] couldn't inspect file: {exc}")
+        return
+    with JOBS_LOCK:
+        if job_id in JOBS:
+            JOBS[job_id]["media_info"] = text
+
+
 def run_job(job_id: str, url: str, embed_thumbnail: bool, save_thumbnail: bool,
             audio_only: bool, video_quality: str, audio_quality: str, ios_compat: bool = False):
     job_dir = SCRATCH_DIR / job_id
@@ -156,15 +290,18 @@ def run_job(job_id: str, url: str, embed_thumbnail: bool, save_thumbnail: bool,
         medias = [p for p in job_dir.glob("*") if p.suffix.lower() in MEDIA_EXTS]
         video_file = medias[0] if medias else None
         ok = video_file is not None
+        if ok and video_file.suffix.lower() == ".mp4":
+            finalize_media(job_id, video_file, ios_compat)
         if ok:
             thumbs = [p for p in job_dir.glob("*.jpg")]
             thumb_file = thumbs[0] if thumbs else None
 
     with JOBS_LOCK:
-        if job_id in JOBS:
-            JOBS[job_id]["status"] = "done" if ok else "error"
-            JOBS[job_id]["file"] = video_file
-            JOBS[job_id]["thumb"] = thumb_file
+        if job_id not in JOBS:
+            return  # cancelled during conversion
+        JOBS[job_id]["status"] = "done" if ok else "error"
+        JOBS[job_id]["file"] = video_file
+        JOBS[job_id]["thumb"] = thumb_file
     if not ok:
         shutil.rmtree(job_dir, ignore_errors=True)
 
@@ -262,6 +399,8 @@ def jobs_json():
         out = []
         for job_id, job in items:
             phase, percent = parse_progress(job["tail"])
+            if job.get("converting"):
+                phase, percent = "Converting for iPhone", job.get("convert_pct")
             out.append({
                 "id": job_id,
                 "url": job["url"],
@@ -270,6 +409,7 @@ def jobs_json():
                 "percent": 100 if job["status"] == "done" else percent,
                 "tail": job["tail"],
                 "quality_label": job.get("quality_label", ""),
+                "media_info": job.get("media_info"),
                 "filename": job["file"].name if job["file"] else None,
                 "size": job["file"].stat().st_size if job["file"] and job["file"].exists() else None,
                 "kind": "audio" if job["file"] and job["file"].suffix.lower() in AUDIO_EXTS else "video",
@@ -297,6 +437,17 @@ def dismiss_job(job_id):
     return "", 204
 
 
+def content_disposition(filename: str) -> str:
+    """HTTP headers are latin-1 only, but titles (Instagram captions, Cyrillic, emoji…) aren't.
+    Send a safe ASCII name that always keeps the extension, plus the real name as RFC 5987 filename*."""
+    ext = Path(filename).suffix
+    ascii_name = unicodedata.normalize("NFKD", filename).encode("ascii", "ignore").decode()
+    ascii_name = re.sub(r"[^A-Za-z0-9._ -]", "_", ascii_name).strip(" .") or "download"
+    if ext and not ascii_name.lower().endswith(ext.lower()):
+        ascii_name += ext
+    return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(filename, safe='')}"
+
+
 def deliver(job_id: str, key: str, mimetype: str = None):
     with JOBS_LOCK:
         job = JOBS.get(job_id)
@@ -320,7 +471,7 @@ def deliver(job_id: str, key: str, mimetype: str = None):
             release_delivered(job_id)
 
     resp = Response(generate(), mimetype=mimetype)
-    resp.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+    resp.headers["Content-Disposition"] = content_disposition(filename)
     resp.headers["Content-Length"] = str(size)
     return resp
 
@@ -666,7 +817,7 @@ function createCard(job){
 function updateCard(c, job){
   c.status.className = 'status-pill status-' + job.status;
   c.stext.textContent = job.status === 'running' ? 'Running' : (job.status === 'done' ? 'Ready' : 'Failed');
-  c.phase.textContent = job.phase;
+  c.phase.textContent = (job.status === 'done' && job.media_info) ? 'Ready · ' + job.media_info : job.phase;
   if (job.status === 'running' && !c.wiredCancel) {
     c.wiredCancel = true;
     const btn = document.createElement('button');
@@ -736,8 +887,15 @@ async function downloadKind(c, jobId, kind, btn, origLabel){
     if (!res.ok) throw new Error('expired');
     const total = parseInt(res.headers.get('Content-Length') || '0', 10);
     const cd = res.headers.get('Content-Disposition') || '';
-    const m = cd.match(/filename="([^"]+)"/);
-    const filename = m ? m[1] : (kind === 'video' ? 'video.mp4' : 'thumbnail.jpg');
+    let filename = null;
+    const star = cd.match(/filename\\*=UTF-8''([^;]+)/i);
+    if (star) { try { filename = decodeURIComponent(star[1]); } catch (e) {} }
+    if (!filename) { const m = cd.match(/filename="([^"]+)"/); if (m) filename = m[1]; }
+    if (!filename) filename = kind === 'video' ? 'video.mp4' : 'thumbnail.jpg';
+    if (!/\\.[A-Za-z0-9]{2,5}$/.test(filename)) {   // iOS can't open a file that has lost its extension
+      const ext = {'video/mp4': '.mp4', 'audio/mpeg': '.mp3', 'image/jpeg': '.jpg'}[res.headers.get('Content-Type')] || '';
+      filename += ext;
+    }
     if (res.body && res.body.getReader) {
       const reader = res.body.getReader();
       const chunks = []; let received = 0;
@@ -820,14 +978,19 @@ function currentOptions(){
 }
 
 async function submitUrl(url, options){
-  await fetch('/download', {method:'POST', body: new URLSearchParams({url, ...options})});
-  poll();
+  const res = await fetch('/download', {method:'POST', body: new URLSearchParams({url, ...options})});
+  const {id} = await res.json();
+  // the job registers a beat after the POST returns — poll until its card exists
+  for (let i = 0; i < 6 && !cards.has(id); i++) {
+    await poll();
+    if (!cards.has(id)) await new Promise(r => setTimeout(r, 150));
+  }
+  return id;
 }
 
 const pasteHint = document.getElementById('pasteHint');
 document.getElementById('pasteBtn').addEventListener('click', async () => {
   const field = document.getElementById('url');
-  field.focus();
   if (window.isSecureContext && navigator.clipboard && navigator.clipboard.readText) {
     try {
       const text = (await navigator.clipboard.readText()).trim();
@@ -839,6 +1002,7 @@ document.getElementById('pasteBtn').addEventListener('click', async () => {
       }
     } catch (e) { /* permission denied — fall through to the hint */ }
   }
+  field.focus();
   pasteHint.classList.add('show');
   setTimeout(() => pasteHint.classList.remove('show'), 6000);
 });
@@ -861,15 +1025,16 @@ form.addEventListener('submit', async (e) => {
   e.preventDefault();
   const url = input.value.trim();
   if (!url) return;
+  input.blur();  // close the on-screen keyboard; don't steal focus back to the field afterwards
   submitBtn.disabled = true;
   submitLabel.innerHTML = '<span class="spinner"></span>';
   try {
-    await submitUrl(url, currentOptions());
+    const id = await submitUrl(url, currentOptions());
     input.value = '';
+    cards.get(id)?.el.scrollIntoView({behavior: 'smooth', block: 'nearest'});
   } finally {
     submitBtn.disabled = false;
     submitLabel.textContent = '✨ Download';
-    input.focus();
   }
 });
 </script>
