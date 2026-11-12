@@ -4,7 +4,7 @@ A tiny, self-hosted YouTube (and anything else [yt-dlp](https://github.com/yt-dl
 
 - **No files are kept on the server.** Each download lives in a temporary per-job folder just long enough to process, then streams straight to your browser and is deleted the moment the transfer finishes (or the instant you cancel it).
 - **Quality presets** for video (Best/4K/1440p/1080p/720p/480p/360p) and MP3 (Best/320k/256k/192k/128k).
-- **iPhone-friendly mode** (on by default). Sources like YouTube (often AV1) and Instagram can hand back video that iPhones won't play in the built-in player or import into Photos. This mode prefers H.264 where the site offers it, then inspects the finished file and, only if needed, converts it to H.264 + AAC (or just fixes the HEVC tag, which is instant). Files that are already fine are left untouched. Conversion shows live progress and can be cancelled; on a Raspberry Pi it runs at roughly real-time speed. Turn it off for the untouched original.
+- **iPhone-friendly mode** (off by default — turn it on when a file won't play on your iPhone). Sources like YouTube (often AV1) and Instagram can hand back video that iPhones won't play in the built-in player or import into Photos. This mode prefers H.264 where the site offers it, then inspects the finished file and, only if needed, converts it to H.264 + AAC (or just fixes the HEVC tag, which is instant). Files that are already fine are left untouched. Conversion shows live progress and can be cancelled; on a Raspberry Pi the conversion is slow (roughly real-time or worse, and it pegs the CPU), which is why it's opt-in. Leave it off for the untouched original.
 - **Codec readout** on every finished card (e.g. `H.264 + AAC · 1080×1920`), so you can see exactly what you're getting.
 - **Optional thumbnail embedding** and/or **saving the thumbnail as its own file** — independent toggles, either, both, or neither.
 - **Cancel button** that actually kills the underlying `yt-dlp`/`ffmpeg` process and wipes the partial file — not just a UI dismiss.
@@ -87,7 +87,7 @@ yt-dlp-grab-web/
 
 **"Sign in to confirm you're not a bot"** — YouTube is rejecting the request. Upload fresh cookies in Settings (export them from a private/incognito window, then close it, so the browser doesn't rotate the session out from under the file). A stale or rotated `cookies.txt` is the usual cause.
 
-**Downloaded video won't play on iPhone / "Save to Photos" does nothing** — make sure *iPhone-friendly (H.264)* is on (it's the default) and check the codec readout on the finished card — it should say `H.264 + AAC`. If it does and the file still misbehaves, try again with *Embed thumbnail* off.
+**Downloaded video won't play on iPhone / "Save to Photos" does nothing** — turn on *iPhone-friendly (H.264)* (it's off by default) and check the codec readout on the finished card — it should say `H.264 + AAC`. If it does and the file still misbehaves, try again with *Embed thumbnail* off.
 
 **The 📋 paste button shows a hint instead of pasting** — browsers only allow one-tap clipboard reads on HTTPS (or localhost). Over plain `http://` on your LAN, long-press the field and tap *Paste* instead. Serving the app over HTTPS (e.g. via a reverse proxy or Tailscale) makes the button work.
 

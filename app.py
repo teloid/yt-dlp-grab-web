@@ -745,7 +745,7 @@ INDEX_HTML = PAGE_HEAD + """
         </div>
         <div class="toggle-row" style="margin:1rem 0 0;">
           <span>📱 iPhone-friendly (H.264) <small style="opacity:.7">· max 1080p</small></span>
-          <label class="switch"><input type="checkbox" id="iosToggle" checked><span class="track"></span></label>
+          <label class="switch"><input type="checkbox" id="iosToggle"><span class="track"></span></label>
         </div>
       </div>
       <div class="quality-block" id="audioQualityBlock" style="display:none;">
