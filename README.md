@@ -2,7 +2,8 @@
 
 A tiny, self-hosted YouTube (and anything else [yt-dlp](https://github.com/yt-dlp/yt-dlp) supports) downloader with a cozy web UI. Built to run on a Raspberry Pi or any small Docker host.
 
-- **No files are kept on the server.** Each download lives in a temporary per-job folder just long enough to process, then streams straight to your browser and is deleted the moment the transfer finishes (or the instant you cancel it).
+- **Nothing is kept longer than it takes you to grab it.** Each download lives in a temporary per-job folder; once your browser has the complete file, the server's copy is deleted. Cancel a running job and it's wiped instantly.
+- **History for forgotten downloads.** Closed the tab before saving? Finished files wait for you — reopen the page (even after a container restart) and they're listed with their title, age and size, ready to save or discard. They're kept until you save or discard them; there's no automatic expiry.
 - **Quality presets** for video (Best/4K/1440p/1080p/720p/480p/360p) and MP3 (Best/320k/256k/192k/128k).
 - **iPhone-friendly mode** (off by default — turn it on when a file won't play on your iPhone). Sources like YouTube (often AV1) and Instagram can hand back video that iPhones won't play in the built-in player or import into Photos. This mode prefers H.264 where the site offers it, then inspects the finished file and, only if needed, converts it to H.264 + AAC (or just fixes the HEVC tag, which is instant). Files that are already fine are left untouched. Conversion shows live progress and can be cancelled; on a Raspberry Pi the conversion is slow (roughly real-time or worse, and it pegs the CPU), which is why it's opt-in. Leave it off for the untouched original.
 - **Codec readout** on every finished card (e.g. `H.264 + AAC · 1080×1920`), so you can see exactly what you're getting.
@@ -72,16 +73,16 @@ docker compose restart yt-dlp
 ```
 yt-dlp-grab-web/
 ├── data/            # cookies.txt + EJS cache — the only thing that persists
-└── scratch/         # per-download temp folders — should always end up empty
+└── scratch/         # one folder per download; empty when nothing is waiting for you
 ```
 
-`scratch/` is wiped per-job as soon as a file is delivered to your browser, plus a background sweep every 10 minutes that kills and removes anything older than 3 hours (covers crashed jobs). If you ever see stray folders under `scratch/`, they're safe to delete manually — the container never counts on anything surviving there.
+Each folder in `scratch/` holds a download plus a small `job.json` describing it. A folder is deleted as soon as everything in it has been saved (or you discard it). Finished-but-unsaved folders are what the history shows, and they survive restarts. On startup the app deletes anything that can't be resumed (a download that was mid-flight when the container stopped, or a folder whose files are gone), and a background sweep every 10 minutes kills and removes hung or failed jobs older than 3 hours. Finished downloads are never swept — if disk space matters, glance at the "ready to save · N MB waiting on the Pi" line in the UI and discard what you don't need.
 
 ## How it works, briefly
 
 1. You submit a URL + options. A background thread runs `yt-dlp` as a real subprocess (not the Python library), with your chosen format/quality flags, into a fresh temp folder in its own process group.
 2. The UI polls for progress, parsed straight out of yt-dlp's own `[download] NN%` / `[Merger]` / `[EmbedThumbnail]` log lines.
-3. When it's done, the "Save to your device" button streams the file to your browser via a generator response — the moment that stream finishes, a `finally` block deletes the file (and cleans up the job) server-side. Cancelling does the same thing, except it also sends `SIGTERM` to the whole process group first so a mid-merge `ffmpeg` child doesn't linger.
+3. When it's done, the job is written to disk (`job.json`) and the "Save to your device" button streams the file to your browser. Streaming deletes nothing: a dropped connection or a locked phone just means you tap Save again. Only after the browser confirms it received every byte does it call `POST /files/<id>/ack`, and that's what deletes the server's copy. (The server can't tell by itself — small files vanish into socket buffers instantly, so "finished sending" doesn't mean "received".) Cancelling a running job sends `SIGTERM` to the whole process group first so a mid-merge `ffmpeg` child doesn't linger, then wipes the folder.
 
 ## Troubleshooting
 

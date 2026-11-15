@@ -27,7 +27,7 @@ app.config["MAX_CONTENT_LENGTH"] = 32 * 1024 * 1024  # cookies.txt is tiny
 JOBS = {}
 JOBS_LOCK = threading.Lock()
 
-MAX_JOB_AGE = 3 * 60 * 60  # sweep anything (dead or alive) older than this
+MAX_JOB_AGE = 3 * 60 * 60  # hung or failed jobs are reaped after this; finished ones are kept until saved/discarded
 
 
 MEDIA_EXTS = {".mp4", ".mkv", ".webm", ".mp3", ".m4a", ".opus", ".ogg", ".flac", ".wav"}
@@ -302,8 +302,61 @@ def run_job(job_id: str, url: str, embed_thumbnail: bool, save_thumbnail: bool,
         JOBS[job_id]["status"] = "done" if ok else "error"
         JOBS[job_id]["file"] = video_file
         JOBS[job_id]["thumb"] = thumb_file
-    if not ok:
+        JOBS[job_id]["finished"] = time.time()
+    if ok:
+        save_manifest(job_id)
+    else:
         shutil.rmtree(job_dir, ignore_errors=True)
+
+
+MANIFEST = "job.json"
+
+
+def save_manifest(job_id: str):
+    """Persist a finished job next to its files, so it outlives a closed tab or a restart
+    and shows up in the history until it's saved or discarded."""
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if not job or job["status"] != "done":
+            return
+        job_dir = job["dir"]
+        data = {
+            "url": job["url"], "quality_label": job.get("quality_label", ""),
+            "media_info": job.get("media_info"), "created": job["created"], "finished": job.get("finished"),
+            "file": job["file"].name if job["file"] else None,
+            "thumb": job["thumb"].name if job["thumb"] else None,
+        }
+    try:
+        tmp = job_dir / (MANIFEST + ".tmp")
+        tmp.write_text(json.dumps(data))
+        os.replace(tmp, job_dir / MANIFEST)
+    except OSError:
+        pass  # job was cancelled/discarded underneath us
+
+
+def restore_jobs():
+    """On startup: bring back finished-but-unsaved downloads from disk; delete anything else
+    (a job that was mid-flight when the container stopped can't be resumed)."""
+    for d in SCRATCH_DIR.iterdir():
+        if not d.is_dir():
+            continue
+        try:
+            data = json.loads((d / MANIFEST).read_text())
+            file = d / Path(data["file"]).name if data.get("file") else None
+            thumb = d / Path(data["thumb"]).name if data.get("thumb") else None
+            file = file if file and file.exists() else None
+            thumb = thumb if thumb and thumb.exists() else None
+            if not file and not thumb:
+                raise ValueError("nothing left to deliver")
+        except (OSError, ValueError, KeyError):
+            shutil.rmtree(d, ignore_errors=True)
+            continue
+        JOBS[d.name] = {
+            "url": data.get("url", ""), "status": "done", "dir": d, "file": file, "thumb": thumb,
+            "tail": "", "created": data.get("created") or d.stat().st_mtime,
+            "finished": data.get("finished") or d.stat().st_mtime,
+            "quality_label": data.get("quality_label", ""), "media_info": data.get("media_info"), "proc": None,
+        }
 
 
 def release_delivered(job_id: str):
@@ -323,6 +376,8 @@ def release_delivered(job_id: str):
             JOBS.pop(job_id, None)
     if job_dir:
         shutil.rmtree(job_dir, ignore_errors=True)
+    else:
+        save_manifest(job_id)  # one of the two files is still waiting; remember only that one
 
 
 def parse_progress(tail: str):
@@ -343,25 +398,30 @@ def parse_progress(tail: str):
     return "Starting", None
 
 
+def sweep_once(now: float):
+    """Reap hung/failed jobs and orphaned folders. Finished downloads are deliberately
+    exempt: they stay until they're saved or discarded."""
+    with JOBS_LOCK:
+        stale = [jid for jid, j in JOBS.items() if j["status"] != "done" and now - j["created"] > MAX_JOB_AGE]
+        for jid in stale:
+            proc = JOBS[jid].get("proc")
+            if proc and proc.poll() is None:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            shutil.rmtree(JOBS[jid]["dir"], ignore_errors=True)
+            JOBS.pop(jid, None)
+        known_dirs = {j["dir"].name for j in JOBS.values()}
+    for d in SCRATCH_DIR.iterdir():
+        if d.is_dir() and d.name not in known_dirs and now - d.stat().st_mtime > MAX_JOB_AGE:
+            shutil.rmtree(d, ignore_errors=True)
+
+
 def sweep():
     while True:
         time.sleep(600)
-        now = time.time()
-        with JOBS_LOCK:
-            stale = [jid for jid, j in JOBS.items() if now - j["created"] > MAX_JOB_AGE]
-            for jid in stale:
-                proc = JOBS[jid].get("proc")
-                if proc and proc.poll() is None:
-                    try:
-                        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-                    except (ProcessLookupError, PermissionError):
-                        pass
-                shutil.rmtree(JOBS[jid]["dir"], ignore_errors=True)
-                JOBS.pop(jid, None)
-            known_dirs = {j["dir"].name for j in JOBS.values()}
-        for d in SCRATCH_DIR.iterdir():
-            if d.is_dir() and d.name not in known_dirs and now - d.stat().st_mtime > MAX_JOB_AGE:
-                shutil.rmtree(d, ignore_errors=True)
+        sweep_once(time.time())
 
 
 threading.Thread(target=sweep, daemon=True).start()
@@ -410,6 +470,7 @@ def jobs_json():
                 "tail": job["tail"],
                 "quality_label": job.get("quality_label", ""),
                 "media_info": job.get("media_info"),
+                "age": int(time.time() - job["finished"]) if job.get("finished") else None,
                 "filename": job["file"].name if job["file"] else None,
                 "size": job["file"].stat().st_size if job["file"] and job["file"].exists() else None,
                 "kind": "audio" if job["file"] and job["file"].suffix.lower() in AUDIO_EXTS else "video",
@@ -459,16 +520,14 @@ def deliver(job_id: str, key: str, mimetype: str = None):
     mimetype = mimetype or MIME_MAP.get(path.suffix.lower(), "application/octet-stream")
 
     def generate():
-        try:
-            with open(path, "rb") as f:
-                while True:
-                    chunk = f.read(256 * 1024)
-                    if not chunk:
-                        break
-                    yield chunk
-        finally:
-            path.unlink(missing_ok=True)
-            release_delivered(job_id)
+        # Streaming never deletes anything: "the server finished writing" doesn't mean the phone
+        # got it (socket buffers swallow small files whole). The browser confirms via /ack instead.
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(256 * 1024)
+                if not chunk:
+                    break
+                yield chunk
 
     resp = Response(generate(), mimetype=mimetype)
     resp.headers["Content-Disposition"] = content_disposition(filename)
@@ -484,6 +543,20 @@ def files(job_id):
 @app.route("/files/<job_id>/thumbnail")
 def thumbnail(job_id):
     return deliver(job_id, "thumb", "image/jpeg")
+
+
+@app.route("/files/<job_id>/ack", methods=["POST"])
+def acknowledge(job_id):
+    """The browser holds the complete file now: delete it from the Pi."""
+    key = {"video": "file", "thumb": "thumb"}.get(request.args.get("kind", "video"))
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        path = job[key] if job and key else None
+    if not path:
+        return "", 404
+    path.unlink(missing_ok=True)
+    release_delivered(job_id)
+    return "", 204
 
 
 @app.route("/settings")
@@ -643,6 +716,8 @@ BASE_STYLE = """
   button.primary:disabled{opacity:.7; cursor:default; transform:none;}
   .spinner{width:1rem; height:1rem; border-radius:50%; border:2px solid rgba(255,255,255,.4); border-top-color:#fff; animation:spin .7s linear infinite;}
   @keyframes spin{to{transform:rotate(360deg);}}
+  .summary{margin-top:1.4rem; text-align:center; font-size:.78rem; color:var(--text-dim);}
+  .summary + #jobs{margin-top:.8rem;}
   #jobs{margin-top:1.4rem; display:flex; flex-direction:column; gap:.7rem;}
   .job{
     background:rgba(0,0,0,.22); border:1px solid var(--card-border); border-radius:16px; padding:.85rem 1rem;
@@ -772,11 +847,13 @@ INDEX_HTML = PAGE_HEAD + """
       <span class="pill {{ 'ok' if cookie_ok else 'no' }}"><span class="dot"></span>
         {{ 'Cookies loaded' if cookie_ok else 'No cookies — some videos may fail' }}</span>
     </div>
+    <div class="summary" id="summary" style="display:none"></div>
     <div id="jobs"></div>
   </div>
 </div>
 <script>
 const jobsEl = document.getElementById('jobs');
+const summaryEl = document.getElementById('summary');
 const cards = new Map();
 
 function fmtSize(b){
@@ -791,17 +868,21 @@ function createCard(job){
   el.className = 'job';
   el.innerHTML = `
     <div class="job-top">
-      <div class="job-url" title="${job.url}">${job.url}</div>
-      <span class="quality-badge">${job.quality_label || ''}</span>
+      <div class="job-url"></div>
+      <span class="quality-badge"></span>
       <div class="status-pill status-${job.status}"><span class="dot"></span><span class="stext"></span></div>
     </div>
     <div class="bar-track"><div class="bar-fill"></div></div>
     <div class="job-meta"><span class="phase"></span><span class="pct"></span></div>
     <div class="actions"></div>
   `;
+  el.querySelector('.job-url').textContent = job.url;      // textContent: titles and URLs are untrusted text
+  el.querySelector('.job-url').title = job.url;
+  el.querySelector('.quality-badge').textContent = job.quality_label || '';
   jobsEl.prepend(el);
   return {
     el,
+    title: el.querySelector('.job-url'),
     status: el.querySelector('.status-pill'),
     stext: el.querySelector('.stext'),
     bar: el.querySelector('.bar-fill'),
@@ -856,6 +937,11 @@ function updateCard(c, job){
     c.bar.className = 'bar-fill indet';
     c.pct.textContent = '';
   }
+  if (job.status === 'done') {
+    if (job.age != null) c.pct.textContent = timeAgo(job.age);
+    const name = job.filename || job.thumb_filename;
+    if (name) c.title.textContent = name.replace(/\\.[^.]+$/, '');   // show the video's title, not its URL
+  }
   if (job.status === 'done' && !c.doneInit) {
     c.doneInit = true;
     c.videoNeeded = !!job.filename;
@@ -865,9 +951,39 @@ function updateCard(c, job){
     const mediaLabel = job.kind === 'audio' ? '🎵 Save audio (MP3)' : '🎬 Save video';
     if (c.videoNeeded) row.appendChild(makeSaveButton(c, job.id, 'video', mediaLabel + (job.size ? ' · '+fmtSize(job.size) : '')));
     if (c.thumbNeeded) row.appendChild(makeSaveButton(c, job.id, 'thumb', '🖼️ Save thumbnail' + (job.thumb_size ? ' · '+fmtSize(job.thumb_size) : '')));
+    c.discardBtn = makeDiscardButton(job.id);
+    row.appendChild(c.discardBtn);
     c.actions.innerHTML = '';
     c.actions.appendChild(row);
   }
+}
+
+function timeAgo(seconds){
+  if (seconds < 60) return 'just now';
+  if (seconds < 3600) return Math.floor(seconds / 60) + ' min ago';
+  if (seconds < 86400) return Math.floor(seconds / 3600) + ' h ago';
+  return Math.floor(seconds / 86400) + ' d ago';
+}
+
+// Two taps, so a stray touch can't throw away a finished download.
+function makeDiscardButton(jobId){
+  const btn = document.createElement('button');
+  btn.className = 'btn-small btn-ghost';
+  btn.textContent = '🗑';
+  btn.title = 'Discard without saving';
+  let armed = false, timer = null;
+  btn.onclick = async () => {
+    if (!armed) {
+      armed = true; btn.textContent = 'Discard?';
+      timer = setTimeout(() => { armed = false; btn.textContent = '🗑'; }, 3000);
+      return;
+    }
+    clearTimeout(timer);
+    btn.disabled = true;
+    await fetch('/jobs/' + jobId, {method: 'DELETE'});
+    removeCard(jobId);
+  };
+  return btn;
 }
 
 function makeSaveButton(c, jobId, kind, label){
@@ -880,6 +996,7 @@ function makeSaveButton(c, jobId, kind, label){
 
 async function downloadKind(c, jobId, kind, btn, origLabel){
   btn.disabled = true;
+  if (c.discardBtn) c.discardBtn.disabled = true;
   btn.classList.remove('glow');
   const endpoint = kind === 'video' ? `/files/${jobId}` : `/files/${jobId}/thumbnail`;
   try {
@@ -905,11 +1022,14 @@ async function downloadKind(c, jobId, kind, btn, origLabel){
         chunks.push(value); received += value.length;
         if (total) btn.textContent = Math.round(received / total * 100) + '%';
       }
+      if (total && received !== total) throw new Error('incomplete download');
       const blob = new Blob(chunks);
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a'); a.href = url; a.download = filename;
       document.body.appendChild(a); a.click(); a.remove();
       setTimeout(() => URL.revokeObjectURL(url), 15000);
+      // We hold every byte now — only then is it safe for the Pi to delete its copy.
+      try { await fetch(`/files/${jobId}/ack?kind=${kind}`, {method: 'POST'}); } catch (e) {}
     } else {
       window.location = endpoint;
     }
@@ -922,6 +1042,8 @@ async function downloadKind(c, jobId, kind, btn, origLabel){
     btn.disabled = false;
     btn.textContent = origLabel;
     btn.classList.add('glow');
+  } finally {
+    if (c.discardBtn) c.discardBtn.disabled = false;
   }
 }
 
@@ -944,7 +1066,7 @@ async function poll(){
     const res = await fetch('/jobs.json');
     const jobs = await res.json();
     const seen = new Set();
-    for (const job of jobs) {
+    for (const job of [...jobs].reverse()) {   // oldest first, because new cards get prepended
       seen.add(job.id);
       let c = cards.get(job.id);
       if (!c) {
@@ -957,6 +1079,10 @@ async function poll(){
     for (const [id, c] of cards) {
       if (!seen.has(id)) removeCard(id);
     }
+    const waiting = jobs.filter(j => j.status === 'done');
+    const waitingBytes = waiting.reduce((sum, j) => sum + (j.size || 0) + (j.thumb_size || 0), 0);
+    summaryEl.textContent = waiting.length ? `📦 ${waiting.length} ready to save · ${fmtSize(waitingBytes)} waiting on the Pi` : '';
+    summaryEl.style.display = waiting.length ? '' : 'none';
     renderEmpty();
   } catch (e) {}
 }
@@ -1103,4 +1229,5 @@ document.getElementById('clearBtn')?.addEventListener('click', async () => {
 
 
 if __name__ == "__main__":
+    restore_jobs()
     app.run(host="0.0.0.0", port=8090, threaded=True)
